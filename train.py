@@ -11,6 +11,7 @@ import sys
 import time
 import argparse
 import json
+import math
 
 import numpy as np
 import torch
@@ -25,9 +26,10 @@ from src import texture
 from src import render
 from src import regularizer
 from src.mesh import Mesh
-
+from PointRenderer import OldPointRenderer
+import cv2
 RADIUS = 3.5
-
+point_renderer = OldPointRenderer()
 # Enable to debug back-prop anomalies
 # torch.autograd.set_detect_anomaly(True)
 
@@ -40,6 +42,26 @@ def load_mesh(filename, mtl_override=None):
     if ext == ".obj":
         return obj.load_obj(filename, clear_ks=True, mtl_override=mtl_override)
     assert False, "Invalid mesh file extension"
+
+def to_img(points, ref, opt): #[1,N,rgbxy]
+    img = np.ones((512,512,3),dtype = np.float32)
+    img[...,0:2]=0
+    img_gt = ref.cpu().numpy()
+    img_opt = opt.detach().cpu().numpy()
+    print("to_img")
+    points = points[0].cpu().numpy()
+    for item in points:
+        h = max(0,min(512,int((item[4]+1)/2*512)))
+        w = max(0,min(512,int((item[3]+1)/2*512)))
+        img[h,w] = item[:3]
+    img_gt = cv2.cvtColor(img_gt, cv2.COLOR_BGR2RGB)
+    img_opt = cv2.cvtColor(img_opt, cv2.COLOR_BGR2RGB)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    cv2.imshow("spot",img)
+    cv2.imshow("gt",img_gt)
+    cv2.imshow("opt",img_opt)
+    cv2.waitKey(0)
+
 
 ###############################################################################
 # Loss setup
@@ -130,8 +152,16 @@ def optimize_mesh(
         ksB = np.random.uniform(size=FLAGS.texture_res + [1], low=0.0, high=1.0)
         ks_map_opt = texture.create_trainable(np.concatenate((ksR, ksG, ksB), axis=2), FLAGS.texture_res, not FLAGS.custom_mip)
     else:
-        kd_map_opt = texture.create_trainable(ref_mesh.material['kd'], FLAGS.texture_res, not FLAGS.custom_mip)
-        ks_map_opt = texture.create_trainable(ref_mesh.material['ks'], FLAGS.texture_res, not FLAGS.custom_mip)
+        if FLAGS.layers > 1:
+            kd_map_opt = texture.create_trainable(np.random.uniform(size=FLAGS.texture_res + [4], low=0.0, high=1.0)*0+0.5, FLAGS.texture_res, not FLAGS.custom_mip)
+        else:
+            kd_map_opt = texture.create_trainable(np.random.uniform(size=FLAGS.texture_res + [3], low=0.0, high=1.0)*0+0.5, FLAGS.texture_res, not FLAGS.custom_mip)
+        ksR = np.random.uniform(size=FLAGS.texture_res + [1], low=0.0, high=0.01) * 0+0.5
+        ksG = np.random.uniform(size=FLAGS.texture_res + [1], low=FLAGS.min_roughness, high=1.0) * 0+0.5
+        ksB = np.random.uniform(size=FLAGS.texture_res + [1], low=0.0, high=1.0) * 0+0.5
+        ks_map_opt = texture.create_trainable(np.concatenate((ksR, ksG, ksB), axis=2), FLAGS.texture_res, not FLAGS.custom_mip)
+        #kd_map_opt = texture.create_trainable(ref_mesh.material['kd'], FLAGS.texture_res, not FLAGS.custom_mip)
+        #ks_map_opt = texture.create_trainable(ref_mesh.material['ks'], FLAGS.texture_res, not FLAGS.custom_mip)
 
     # Trainable displacement map
     displacement_map_var = None
@@ -185,7 +215,6 @@ def optimize_mesh(
 
     # Set up tangent space
     opt_base_mesh = mesh.compute_tangents(opt_base_mesh)
-
     # Subdivide if we're doing displacement mapping
     if FLAGS.subdivision > 0:
         # Subdivide & displace optimized mesh
@@ -232,6 +261,24 @@ def optimize_mesh(
     lap_loss_vec = []
     iter_dur_vec = []
     glctx = dr.RasterizeGLContext()
+    
+    mvps = np.zeros((100, 4,4),  dtype=np.float32)
+    camposs   = np.zeros((100, 3), dtype=np.float32)
+    lightposs = np.zeros((100, 3), dtype=np.float32)
+    for b in range(100):
+        r_rot      = util.random_rotation_translation(0.25)
+        r_mv       = np.matmul(util.translate(0, 0, -RADIUS), r_rot)
+        mvps[b]     = np.matmul(proj_mtx, r_mv).astype(np.float32)
+        camposs[b]  = np.linalg.inv(r_mv)[:3, 3]
+        lightposs[b] = util.cosine_sample(camposs[b])*RADIUS
+    
+    
+    def get_point_info(glctx,mvp,pos,pos_idx,iter_res, rgb):
+        has_pos, uvw, tri_id = point_renderer.render_point(glctx,mvp,pos,pos_idx,iter_res)
+        render_pos = point_renderer.point_renderer_nvdiffrast(glctx, mvp, tri_id, uvw, pos)
+        render_rgb = rgb[has_pos>0]
+        return torch.cat((render_rgb[None], render_pos),axis=2)
+
     for it in range(FLAGS.iter+1):
         # ==============================================================================================
         #  Display / save outputs. Do it before training so we get initial meshes
@@ -256,6 +303,7 @@ def optimize_mesh(
             with torch.no_grad():
                 # Center meshes
                 _opt_detail = mesh.center_by_reference(opt_detail_mesh.eval(params), ref_mesh_aabb, mesh_scale)
+                #_opt_detail = opt_detail_mesh.eval(params)
                 _opt_ref    = mesh.center_by_reference(render_ref_mesh.eval(params), ref_mesh_aabb, mesh_scale)
 
                 # Render
@@ -311,26 +359,25 @@ def optimize_mesh(
         # ==============================================================================================
         #  Build transform stack for minibatching
         # ==============================================================================================
+        
         for b in range(FLAGS.batch):
-            # Random rotation/translation matrix for optimization.
             r_rot      = util.random_rotation_translation(0.25)
             r_mv       = np.matmul(util.translate(0, 0, -RADIUS), r_rot)
             mvp[b]     = np.matmul(proj_mtx, r_mv).astype(np.float32)
             campos[b]  = np.linalg.inv(r_mv)[:3, 3]
             lightpos[b] = util.cosine_sample(campos[b])*RADIUS
 
-
         params = {'mvp' : mvp, 'lightpos' : lightpos, 'campos' : campos, 'resolution' : [iter_res, iter_res], 'time' : 0}
 
         # Random bg color
+        #randomBgColor = torch.ones((FLAGS.batch, iter_res, iter_res, 3), dtype=torch.float32, device='cuda')
         randomBgColor = torch.rand(FLAGS.batch, iter_res, iter_res, 3, dtype=torch.float32, device='cuda')
-
         # ==============================================================================================
         #  Evaluate all mesh ops (may change when positions are modified etc) and center/align meshes
         # ==============================================================================================
         _opt_ref  = mesh.center_by_reference(render_ref_mesh.eval(params), ref_mesh_aabb, mesh_scale)
         _opt_detail = mesh.center_by_reference(opt_detail_mesh.eval(params), ref_mesh_aabb, mesh_scale)
-
+        #_opt_detail = opt_detail_mesh.eval(params)
         # ==============================================================================================
         #  Render reference mesh
         # ==============================================================================================
@@ -374,9 +421,36 @@ def optimize_mesh(
         else:
             lap_fac = (lap_fac - min_lap_fac) * 10**(-it*0.000001) + min_lap_fac
 
+        total_loss = lap_loss * lap_fac + img_loss
+        if False:
         # Compute total aggregate loss
-        total_loss = img_loss + lap_loss * lap_fac
-
+            def save_img(img,title):
+                img = img.detach().cpu().numpy()
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = (np.clip(img,0,1)*255).astype(np.uint8)
+                cv2.imwrite(title, img)
+            save_img(color_ref[0],"ref.png")
+            save_img(color_opt[0],"opt.png")
+            print("rgb lap",total_loss.item())
+            for x in range(8):
+                pos = _opt_detail.v_pos
+                pos_idx = _opt_detail.t_pos_idx.int()
+                opt_point = get_point_info(glctx,mvp[x],pos,pos_idx,iter_res,color_opt[x:x+1])
+                pos = _opt_ref.v_pos
+                pos_idx = _opt_ref.t_pos_idx.int()
+                ref_point = get_point_info(glctx,mvp[x],pos,pos_idx,iter_res,color_ref[x:x+1])
+                #t = math.ceil(opt_point.shape[1]/ref_point.shape[1])
+                #ref_point = ref_point.repeat(1,t,1)
+                #ref_point_npy = ref_point.cpu().detach().numpy()[0]
+                #opt_point_npy = opt_point.cpu().detach().numpy()[0]
+                opt_point_target,siz = point_renderer.match2(ref_point, opt_point)
+                opt_point_target = opt_point_target.to('cuda')
+                #to_img(opt_point_target.detach(), color_ref[x], color_opt[x])
+                pos_rgb_loss = torch.mean((opt_point_target-opt_point)**2)
+                total_loss+=pos_rgb_loss/8
+            print("rgb pos",total_loss.item())
+            if it%100==0:
+                obj.write_obj(os.path.join(out_dir, "mesh/"), opt_base_mesh.eval(), suf=str(it))
         # ==============================================================================================
         #  Backpropagate
         # ==============================================================================================
@@ -409,7 +483,7 @@ def optimize_mesh(
             remaining_time = (FLAGS.iter-it)*iter_dur_avg
             print("iter=%5d, img_loss=%.6f, lap_loss=%.6f, lr=%.5f, time=%.1f ms, rem=%s" % 
                 (it, img_loss_avg, lap_loss_avg*lap_fac, optimizer.param_groups[0]['lr'], iter_dur_avg*1000, util.time_to_text(remaining_time)))
-
+            
     # Save final mesh to file
     obj.write_obj(os.path.join(out_dir, "mesh/"), opt_base_mesh.eval())
 
@@ -427,8 +501,8 @@ def main():
     parser.add_argument('-rtr', '--random-train-res', action='store_true', default=False)
     parser.add_argument('-dr', '--display-res', type=int, default=None)
     parser.add_argument('-tr', '--texture-res', nargs=2, type=int, default=[1024, 1024])
-    parser.add_argument('-di', '--display-interval', type=int, default=0)
-    parser.add_argument('-si', '--save-interval', type=int, default=1000)
+    parser.add_argument('-di', '--display-interval', type=int, default=10)
+    parser.add_argument('-si', '--save-interval', type=int, default=100)
     parser.add_argument('-lr', '--learning-rate', type=float, default=None)
     parser.add_argument('-lp', '--light-power', type=float, default=5.0)
     parser.add_argument('-mr', '--min-roughness', type=float, default=0.08)

@@ -113,6 +113,8 @@ def unit_size(mesh):
 # instead of centering and scaling all meshes
 ######################################################################################
 def center_by_reference(base_mesh, ref_aabb, scale):
+    
+    #return base_mesh
     center = (ref_aabb[0] + ref_aabb[1]) * 0.5
     scale = scale / torch.max(ref_aabb[1] - ref_aabb[0]).item()
     v_pos = (base_mesh.v_pos - center[None, ...]) * scale

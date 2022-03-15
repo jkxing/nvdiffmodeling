@@ -6,12 +6,14 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import os
 import sys
+sys.path.append("../")
+import os
 import time
 import argparse
 import json
 import math
+from attr import has
 
 import numpy as np
 import torch
@@ -26,10 +28,8 @@ from src import texture
 from src import render
 from src import regularizer
 from src.mesh import Mesh
-from PointRenderer import OldPointRenderer
 import cv2
 RADIUS = 3.5
-point_renderer = OldPointRenderer()
 # Enable to debug back-prop anomalies
 # torch.autograd.set_detect_anomaly(True)
 
@@ -84,6 +84,17 @@ def createLoss(FLAGS):
 ###############################################################################
 # Main shape fitter function / optimization loop
 ###############################################################################
+class PSNR:
+    """Peak Signal to Noise Ratio
+    img1 and img2 have range [0, 1]"""
+
+    def __init__(self):
+        self.name = "PSNR"
+
+    @staticmethod
+    def __call__(img1, img2):
+        mse = torch.mean((img1 - img2) ** 2)
+        return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 def optimize_mesh(
     FLAGS,
@@ -262,23 +273,26 @@ def optimize_mesh(
     iter_dur_vec = []
     glctx = dr.RasterizeGLContext()
     
-    mvps = np.zeros((100, 4,4),  dtype=np.float32)
-    camposs   = np.zeros((100, 3), dtype=np.float32)
-    lightposs = np.zeros((100, 3), dtype=np.float32)
-    for b in range(100):
-        r_rot      = util.random_rotation_translation(0.25)
-        r_mv       = np.matmul(util.translate(0, 0, -RADIUS), r_rot)
-        mvps[b]     = np.matmul(proj_mtx, r_mv).astype(np.float32)
-        camposs[b]  = np.linalg.inv(r_mv)[:3, 3]
-        lightposs[b] = util.cosine_sample(camposs[b])*RADIUS
+    #mvps = np.zeros((100, 4,4),  dtype=np.float32)
+    #camposs   = np.zeros((100, 3), dtype=np.float32)
+    #lightposs = np.zeros((100, 3), dtype=np.float32)
+    #for b in range(100):
+    #    r_rot      = util.random_rotation_translation(0.25)
+    #    r_mv       = np.matmul(util.translate(0, 0, -RADIUS), r_rot)
+    #    mvps[b]     = np.matmul(proj_mtx, r_mv).astype(np.float32)
+    #    camposs[b]  = np.linalg.inv(r_mv)[:3, 3]
+    #    lightposs[b] = util.cosine_sample(camposs[b])*RADIUS
+    psnr = PSNR()
     
+    from PointRenderer.PointRenderer import NvdiffrastPointRenderer
+    point_renderer = NvdiffrastPointRenderer(device='cuda',resolution=FLAGS.train_res)
+    def get_point_info(glctx,mvp,pos,pos_idx):
+        haspos, uvw, pos_clip, tri_id, num_per_view = point_renderer.render_point_image(glctx,mvp,pos,pos_idx,FLAGS.train_res)
+        render_pos = point_renderer.render_point(tri_id, pos_clip[0], uvw)  # (N,2)
+        return haspos, render_pos
     
-    def get_point_info(glctx,mvp,pos,pos_idx,iter_res, rgb):
-        has_pos, uvw, tri_id = point_renderer.render_point(glctx,mvp,pos,pos_idx,iter_res)
-        render_pos = point_renderer.point_renderer_nvdiffrast(glctx, mvp, tri_id, uvw, pos)
-        render_rgb = rgb[has_pos>0]
-        return torch.cat((render_rgb[None], render_pos),axis=2)
-
+    from geomloss import SamplesLoss
+    pointloss = SamplesLoss("sinkhorn", blur=0.3)
     for it in range(FLAGS.iter+1):
         # ==============================================================================================
         #  Display / save outputs. Do it before training so we get initial meshes
@@ -287,6 +301,7 @@ def optimize_mesh(
         # Show/save image before training step (want to get correct rendering of input)
         display_image = FLAGS.display_interval and (it % FLAGS.display_interval == 0)
         save_image = FLAGS.save_interval and (it % FLAGS.save_interval == 0)
+        display_image = False
         if display_image or save_image:
             eye = np.array(FLAGS.camera_eye)
             up  = np.array(FLAGS.camera_up)
@@ -321,7 +336,7 @@ def optimize_mesh(
                 # Rescale
                 img_opt  = util.scale_img_nhwc(img_opt,  [FLAGS.display_res, FLAGS.display_res])
                 img_ref  = util.scale_img_nhwc(img_ref,  [FLAGS.display_res, FLAGS.display_res])
-
+                #print(it)
                 if FLAGS.subdivision > 0:
                     img_disp = torch.clamp(torch.abs(displacement_map_var[None, ...]), min=0.0, max=1.0).repeat(1,1,1,3)
                     img_disp = util.scale_img_nhwc(img_disp, [FLAGS.display_res, FLAGS.display_res])
@@ -340,7 +355,7 @@ def optimize_mesh(
         # ==============================================================================================
         #  Initialize training
         # ==============================================================================================
-
+        
         iter_start_time = time.time()
         img_loss = torch.zeros([1], dtype=torch.float32, device='cuda')
         lap_loss = torch.zeros([1], dtype=torch.float32, device='cuda')
@@ -422,35 +437,27 @@ def optimize_mesh(
             lap_fac = (lap_fac - min_lap_fac) * 10**(-it*0.000001) + min_lap_fac
 
         total_loss = lap_loss * lap_fac + img_loss
-        if False:
-        # Compute total aggregate loss
-            def save_img(img,title):
-                img = img.detach().cpu().numpy()
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = (np.clip(img,0,1)*255).astype(np.uint8)
-                cv2.imwrite(title, img)
-            save_img(color_ref[0],"ref.png")
-            save_img(color_opt[0],"opt.png")
-            print("rgb lap",total_loss.item())
-            for x in range(8):
+        point_loss = 0.0
+        if True:
+            for vn in range(FLAGS.batch):
                 pos = _opt_detail.v_pos
                 pos_idx = _opt_detail.t_pos_idx.int()
-                opt_point = get_point_info(glctx,mvp[x],pos,pos_idx,iter_res,color_opt[x:x+1])
-                pos = _opt_ref.v_pos
-                pos_idx = _opt_ref.t_pos_idx.int()
-                ref_point = get_point_info(glctx,mvp[x],pos,pos_idx,iter_res,color_ref[x:x+1])
-                #t = math.ceil(opt_point.shape[1]/ref_point.shape[1])
-                #ref_point = ref_point.repeat(1,t,1)
-                #ref_point_npy = ref_point.cpu().detach().numpy()[0]
-                #opt_point_npy = opt_point.cpu().detach().numpy()[0]
-                opt_point_target,siz = point_renderer.match2(ref_point, opt_point)
-                opt_point_target = opt_point_target.to('cuda')
-                #to_img(opt_point_target.detach(), color_ref[x], color_opt[x])
-                pos_rgb_loss = torch.mean((opt_point_target-opt_point)**2)
-                total_loss+=pos_rgb_loss/8
-            print("rgb pos",total_loss.item())
-            if it%100==0:
-                obj.write_obj(os.path.join(out_dir, "mesh/"), opt_base_mesh.eval(), suf=str(it))
+                haspos, render_pos = get_point_info(glctx,mvp[vn:vn+1],pos,pos_idx)
+                h, w = haspos.shape[1:3]
+                x = torch.linspace(0, 1, w)
+                y = torch.linspace(0, 1, h)
+                pos = torch.meshgrid(x, y)
+                pos = torch.cat([pos[1][..., None], pos[0][..., None]], dim=2)
+                render_pos_img = pos.clone().to('cuda')
+                render_pos_img[haspos[0] > 0] = render_pos
+                render_rgb = torch.clamp(color_opt[vn, ..., :3],0.0,1.0)
+                target_rgb = torch.clamp(color_ref[vn,..., :3].detach(),0.0,1.0)
+                render_point_5d = torch.cat([render_rgb, render_pos_img], dim=2).reshape(-1, 5)
+                target_point_5d = torch.zeros((h, w, 5), device='cuda')
+                target_point_5d[..., :3] = target_rgb
+                target_point_5d[..., 3:] = pos
+                point_loss = pointloss(render_point_5d, target_point_5d.reshape(-1, 5))
+                total_loss+=point_loss
         # ==============================================================================================
         #  Backpropagate
         # ==============================================================================================
@@ -482,8 +489,7 @@ def optimize_mesh(
             
             remaining_time = (FLAGS.iter-it)*iter_dur_avg
             print("iter=%5d, img_loss=%.6f, lap_loss=%.6f, lr=%.5f, time=%.1f ms, rem=%s" % 
-                (it, img_loss_avg, lap_loss_avg*lap_fac, optimizer.param_groups[0]['lr'], iter_dur_avg*1000, util.time_to_text(remaining_time)))
-            
+                (it, img_loss_avg, lap_loss_avg*lap_fac, optimizer.param_groups[0]['lr'], iter_dur_avg*1000, util.time_to_text(remaining_time)),psnr(img_opt,img_ref).item(),point_loss)
     # Save final mesh to file
     obj.write_obj(os.path.join(out_dir, "mesh/"), opt_base_mesh.eval())
 

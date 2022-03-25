@@ -438,7 +438,7 @@ def optimize_mesh(
 
         total_loss = lap_loss * lap_fac + img_loss
         point_loss = 0.0
-        if True:
+        if False:
             for vn in range(FLAGS.batch):
                 pos = _opt_detail.v_pos
                 pos_idx = _opt_detail.t_pos_idx.int()

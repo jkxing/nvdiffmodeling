@@ -145,6 +145,9 @@ def render_layer(
     # Scale back up to visibility resolution if using MSAA
     if spp > 1 and msaa:
         color = util.scale_img_nhwc(color, [full_res, full_res], mag='nearest', min='nearest')
+    
+    #TODO:
+    #- add depth and position support
 
     # Return color & raster output for peeling
     return color

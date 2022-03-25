@@ -155,6 +155,7 @@ def skinning(mesh):
         def __init__(self, input):
             self.input = input
             
+            print("skinning")
             mesh = self.input.eval()
             t_pos_idx = mesh.t_pos_idx.detach().cpu().numpy() 
             if mesh.t_nrm_idx is not None:
@@ -265,7 +266,6 @@ def auto_normals(mesh):
             v2 = imesh.v_pos[i2, :]
 
             face_normals = torch.cross(v1 - v0, v2 - v0)
-
             # Splat face normals to vertices
             v_nrm = torch.zeros_like(imesh.v_pos)
             v_nrm.scatter_add_(0, i0[:, None].repeat(1,3), face_normals)
@@ -294,7 +294,9 @@ def compute_tangents(mesh):
             self.input = input
 
         def eval(self, params={}):
+            print(params,"start")
             imesh = self.input.eval(params)
+            print(params,"finish")
 
             vn_idx = [None] * 3
             pos = [None] * 3
